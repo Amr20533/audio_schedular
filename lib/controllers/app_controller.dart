@@ -1,77 +1,115 @@
-import 'dart:convert';
-import 'dart:io';
-
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
 
 import '../models/schedule_settings.dart';
 import '../models/track.dart';
+import '../services/native_bridge.dart';
+import '../services/storage_services.dart';
 
-/// Persists the playlist + settings, and copies picked audio files into
-/// app-private storage so they keep playing even if the originals move.
-class StorageService {
-  static const _tracksKey = 'tracks_v1';
-  static const _settingsKey = 'settings_v1';
+/// Single source of truth for the UI. Every change is saved and pushed to
+/// the native layer so the daily alarm always matches what you see.
+class AppController extends ChangeNotifier {
+  final StorageService _storage = StorageService();
+  final NativeBridge _native = NativeBridge();
 
-  Future<Directory> _tracksDir() async {
-    final base = await getApplicationSupportDirectory();
-    final dir = Directory(p.join(base.path, 'tracks'));
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
+  List<Track> tracks = [];
+  ScheduleSettings settings = ScheduleSettings.defaults();
+  DateTime? nextRun;
+  bool loading = true;
+  bool importing = false;
+
+  Future<void> init() async {
+    tracks = await _storage.loadTracks();
+    settings = await _storage.loadSettings();
+    loading = false;
+    notifyListeners();
+    await _sync(); // re-arm the alarm on every launch
   }
 
-  Future<List<Track>> loadTracks() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_tracksKey);
-    if (raw == null) return [];
-    return (jsonDecode(raw) as List)
-        .map((e) => Track.fromJson(e as Map<String, dynamic>))
-        .where((t) => File(t.path).existsSync())
-        .toList();
-  }
-
-  Future<void> saveTracks(List<Track> tracks) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-        _tracksKey, jsonEncode(tracks.map((t) => t.toJson()).toList()));
-  }
-
-  Future<ScheduleSettings> loadSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_settingsKey);
-    if (raw == null) return ScheduleSettings.defaults();
-    return ScheduleSettings.fromJson(jsonDecode(raw) as Map<String, dynamic>);
-  }
-
-  Future<void> saveSettings(ScheduleSettings s) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_settingsKey, jsonEncode(s.toJson()));
-  }
-
-  /// Copies [sourcePath] into private storage and returns the new [Track].
-  Future<Track> importFile(String sourcePath, String displayName) async {
-    final dir = await _tracksDir();
-    final id = DateTime.now().microsecondsSinceEpoch.toString();
-    final dest = p.join(dir.path, '${id}_${p.basename(sourcePath)}');
-    await File(sourcePath).copy(dest);
-
-    // The picker hands us a cached copy; remove it, but never touch a
-    // user's original file.
+  Future<void> _sync() async {
     try {
-      final tmp = await getTemporaryDirectory();
-      if (p.isWithin(tmp.path, sourcePath)) await File(sourcePath).delete();
-    } catch (_) {}
+      nextRun = await _native.sync(
+        enabled: settings.enabled,
+        start: settings.startTime,
+        stop: settings.stopTime,
+        paths: tracks.map((t) => t.path).toList(),
+      );
+    } catch (e) {
+      debugPrint('Native sync failed: $e');
+    }
+    notifyListeners();
+  }
 
-    return Track(
-      id: id,
-      name: p.basenameWithoutExtension(displayName),
-      path: dest,
+  Future<void> _persist() async {
+    await _storage.saveTracks(tracks);
+    await _storage.saveSettings(settings);
+    await _sync();
+  }
+
+  // ---- playlist ----------------------------------------------------------
+
+  Future<void> addTracks() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.audio,
+      allowMultiple: true,
     );
+    if (result == null) return;
+
+    importing = true;
+    notifyListeners();
+    try {
+      for (final f in result.files) {
+        final path = f.path;
+        if (path == null) continue;
+        tracks = [...tracks, await _storage.importFile(path, f.name)];
+      }
+    } finally {
+      importing = false;
+    }
+    await _persist();
   }
 
-  Future<void> deleteFile(Track track) async {
-    final f = File(track.path);
-    if (await f.exists()) await f.delete();
+  Future<void> removeTrack(Track track) async {
+    tracks = tracks.where((t) => t.id != track.id).toList();
+    notifyListeners();
+    await _storage.deleteFile(track);
+    await _persist();
   }
+
+  Future<void> reorder(int oldIndex, int newIndex) async {
+    if (newIndex > oldIndex) newIndex -= 1;
+    final list = [...tracks];
+    list.insert(newIndex, list.removeAt(oldIndex));
+    tracks = list;
+    notifyListeners();
+    await _persist();
+  }
+
+  // ---- schedule ----------------------------------------------------------
+
+  Future<void> setEnabled(bool value) async {
+    settings = settings.copyWith(enabled: value);
+    notifyListeners();
+    await _persist();
+  }
+
+  Future<void> setStart(TimeOfDay time) async {
+    settings = settings.copyWith(startTime: time);
+    notifyListeners();
+    await _persist();
+  }
+
+  Future<void> setStop(TimeOfDay? time) async {
+    settings = time == null
+        ? settings.copyWith(clearStop: true)
+        : settings.copyWith(stopTime: time);
+    notifyListeners();
+    await _persist();
+  }
+
+  // ---- manual controls ---------------------------------------------------
+
+  Future<void> playNow() => _native.playNow();
+  Future<void> stopNow() => _native.stop();
+  Future<void> openBatterySettings() => _native.openBatterySettings();
 }
