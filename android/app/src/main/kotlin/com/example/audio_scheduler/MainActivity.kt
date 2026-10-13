@@ -1,8 +1,10 @@
-package com.example.adhan_player
+package com.example.audio_scheduler
 
 import android.Manifest
+import android.app.AlarmManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -14,11 +16,33 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Android 13+: needed so the playback notification is visible.
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
+        }
+    }
+
+    private fun canScheduleExactAlarms(): Boolean {
+        if (Build.VERSION.SDK_INT < 31) return true
+        val am = getSystemService(AlarmManager::class.java)
+        return am.canScheduleExactAlarms()
+    }
+
+    private fun requestExactAlarmPermission() {
+        val intent = Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        startActivity(intent)
+    }
+
+    // Re-arm BOTH schedules whenever the user returns to the app — covers
+    // granting the exact-alarm permission in Settings and coming back.
+    override fun onResume() {
+        super.onResume()
+        if (canScheduleExactAlarms()) {
+            AlarmScheduler.scheduleNext(this, "audio")
+            AlarmScheduler.scheduleNext(this, "adhan")
         }
     }
 
@@ -30,21 +54,36 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "sync" -> {
+                        val scheduleId = call.argument<String>("scheduleId") ?: "audio"
                         val enabled = call.argument<Boolean>("enabled") ?: false
                         AlarmScheduler.save(
-                            ctx,
-                            enabled,
+                            ctx, scheduleId, enabled,
                             call.argument<Int>("hour") ?: 8,
                             call.argument<Int>("minute") ?: 0,
                             call.argument<Int>("stopHour") ?: -1,
                             call.argument<Int>("stopMinute") ?: 0,
-                            call.argument<List<String>>("paths") ?: emptyList()
+                            call.argument<List<String>>("paths") ?: emptyList(),
+                            call.argument<String>("label") ?: "Adhan",
+                            call.argument<Int>("reminderMinutes") ?: 10
                         )
-                        if (enabled) AlarmScheduler.scheduleNext(ctx) else AlarmScheduler.cancel(ctx)
-                        result.success(AlarmScheduler.nextStartMillis(ctx))
+
+                        if (enabled && !canScheduleExactAlarms()) {
+                            requestExactAlarmPermission()
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+
+                        if (enabled) AlarmScheduler.scheduleNext(ctx, scheduleId)
+                        else AlarmScheduler.cancel(ctx, scheduleId)
+                        result.success(AlarmScheduler.nextStartMillis(ctx, scheduleId))
+                    }
+                    "testReminderNotification" -> {
+                        PreAdhanReminderReceiver.show(ctx, "adhan_fajr")
+                        result.success(null)
                     }
                     "playNow" -> {
-                        PlaybackService.start(ctx, scheduled = false)
+                        val scheduleId = call.argument<String>("scheduleId") ?: "audio"
+                        PlaybackService.start(ctx, scheduled = false, scheduleId = scheduleId)
                         result.success(null)
                     }
                     "stop" -> {

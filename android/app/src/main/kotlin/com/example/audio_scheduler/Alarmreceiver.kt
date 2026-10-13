@@ -1,13 +1,15 @@
-package com.example.adhan_player
+package com.example.audio_scheduler
 
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.util.Log
 
-/** Fires at the scheduled time: re-arms tomorrow's alarm, then starts playback. */
+/** Fires at the Home screen's scheduled audio time. Independent of Adhan. */
 class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        AlarmScheduler.scheduleNext(context)
-        PlaybackService.start(context, scheduled = true)
+        Log.d("AdhanDebug", "AlarmReceiver[audio].onReceive fired")
+        AlarmScheduler.scheduleNext(context, "audio")
+        PlaybackService.start(context, scheduled = true, scheduleId = "audio")
     }
 }

@@ -1,8 +1,8 @@
+import 'package:audio_scheduler/widgets/schedule_card.dart';
+import 'package:audio_scheduler/widgets/track_tile.dart';
 import 'package:flutter/material.dart';
 
 import '../controllers/app_controller.dart';
-import '../widgets/schedule_card.dart';
-import '../widgets/track_tile.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key, required this.controller});
@@ -15,7 +15,7 @@ class HomeScreen extends StatelessWidget {
       listenable: controller,
       builder: (context, _) {
         return Scaffold(
-          appBar: AppBar(title: const Text('Daily Audio Player')),
+          appBar: AppBar(title: const Text('Signatures Schedular')),
           floatingActionButton: FloatingActionButton.extended(
             onPressed: controller.importing ? null : controller.addTracks,
             icon: const Icon(Icons.library_add),

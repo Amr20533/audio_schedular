@@ -1,4 +1,4 @@
-package com.example.adhan_player
+package com.example.audio_scheduler
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -9,18 +9,22 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import java.io.File
 
 /**
- * Foreground service that plays the saved playlist in order.
- * - No stop time: plays the list once, then stops itself.
- * - Stop time set: loops the list until that time.
+ * Plays whichever schedule ([scheduleId]: "audio" or "adhan") triggered it.
+ * Requests audio focus unconditionally, regardless of whether anything else
+ * is currently playing — this interrupts other apps and lets them resume
+ * once playback ends, every time, with the app locked or not.
  */
 class PlaybackService : Service() {
 
@@ -29,22 +33,31 @@ class PlaybackService : Service() {
     private var index = 0
     private var failures = 0
     private var loop = false
+    private var scheduleId = "audio"
     private val handler = Handler(Looper.getMainLooper())
+
+    private val audioManager by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
+    private var focusRequest: AudioFocusRequest? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d("AdhanDebug", "PlaybackService.onStartCommand action=${intent?.action}")
+
         if (intent?.action == ACTION_STOP) {
+            Log.d("AdhanDebug", "PlaybackService: stop requested")
             stopSelf()
             return START_NOT_STICKY
         }
 
+        scheduleId = intent?.getStringExtra(EXTRA_SCHEDULE_ID) ?: "audio"
         startInForeground()
+        requestAudioFocus()
 
-        // Reset (also covers a second start while already playing).
         handler.removeCallbacksAndMessages(null)
         releasePlayer()
-        playlist = AlarmScheduler.loadPaths(this).filter { File(it).exists() }
+        playlist = AlarmScheduler.loadPaths(this, scheduleId).filter { File(it).exists() }
+        Log.d("AdhanDebug", "PlaybackService[$scheduleId]: loaded playlist, ${playlist.size} playable file(s)")
         index = 0
         failures = 0
 
@@ -56,6 +69,7 @@ class PlaybackService : Service() {
         }
 
         if (playlist.isEmpty()) {
+            Log.w("AdhanDebug", "PlaybackService[$scheduleId]: playlist is EMPTY — stopping")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -65,33 +79,49 @@ class PlaybackService : Service() {
 
     private fun playCurrent() {
         if (index >= playlist.size) {
-            if (loop) index = 0 else { stopSelf(); return }
+            if (loop) index = 0 else {
+                Log.d("AdhanDebug", "PlaybackService[$scheduleId]: playlist finished")
+                stopSelf(); return
+            }
         }
         releasePlayer()
+        val path = playlist[index]
+        Log.d("AdhanDebug", "PlaybackService[$scheduleId]: playing [$index] $path")
         try {
             val mp = MediaPlayer()
             player = mp
             mp.setAudioAttributes(
                 AudioAttributes.Builder()
-                    // Switch to USAGE_ALARM to play on the alarm volume instead.
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
             mp.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
-            mp.setDataSource(playlist[index])
-            mp.setOnPreparedListener { failures = 0; it.start() }
+            mp.setDataSource(path)
+            mp.setOnPreparedListener {
+                Log.d("AdhanDebug", "PlaybackService[$scheduleId]: prepared, starting playback")
+                failures = 0
+                it.start()
+            }
             mp.setOnCompletionListener { handler.post { index++; playCurrent() } }
-            mp.setOnErrorListener { _, _, _ -> handler.post { onTrackFailed() }; true }
+            mp.setOnErrorListener { _, what, extra ->
+                Log.e("AdhanDebug", "PlaybackService[$scheduleId]: MediaPlayer error what=$what extra=$extra for $path")
+                handler.post { onTrackFailed() }
+                true
+            }
             mp.prepareAsync()
         } catch (e: Exception) {
+            Log.e("AdhanDebug", "PlaybackService[$scheduleId]: exception starting $path", e)
             onTrackFailed()
         }
     }
 
     private fun onTrackFailed() {
         failures++
-        if (failures >= playlist.size) { stopSelf(); return }  // nothing playable
+        if (failures >= playlist.size) {
+            Log.w("AdhanDebug", "PlaybackService[$scheduleId]: all tracks failed, stopping")
+            stopSelf(); return
+        }
         index++
         playCurrent()
     }
@@ -101,12 +131,44 @@ class PlaybackService : Service() {
         player = null
     }
 
+    private fun requestAudioFocus() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(attrs)
+                .setWillPauseWhenDucked(false)
+                .build()
+            focusRequest = request
+            val result = audioManager.requestAudioFocus(request)
+            Log.d("AdhanDebug", "requestAudioFocus result=$result")
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            )
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            focusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
+    }
+
     private fun startInForeground() {
         if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "Audio playback", NotificationManager.IMPORTANCE_LOW)
             )
         }
+        val label = AlarmScheduler.label(this, scheduleId)
         val openApp = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
@@ -120,7 +182,8 @@ class PlaybackService : Service() {
             else Notification.Builder(this)
         val notification = builder
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Playing scheduled audio")
+            .setContentTitle("Playing $label")
+            .setContentText("Tap Stop to end playback early")
             .setContentIntent(openApp)
             .addAction(android.R.drawable.ic_media_pause, "Stop", stop)
             .setOngoing(true)
@@ -131,24 +194,30 @@ class PlaybackService : Service() {
         } else {
             startForeground(NOTIF_ID, notification)
         }
+        Log.d("AdhanDebug", "PlaybackService[$scheduleId]: foreground notification shown")
     }
 
     override fun onDestroy() {
+        Log.d("AdhanDebug", "PlaybackService[$scheduleId].onDestroy")
         handler.removeCallbacksAndMessages(null)
         releasePlayer()
+        abandonAudioFocus()
         super.onDestroy()
     }
 
     companion object {
-        const val ACTION_STOP = "com.example.adhan_player.action.STOP"
+        const val ACTION_STOP = "com.example.audio_scheduler.action.STOP"
         private const val EXTRA_STOP_AT = "stop_at"
+        private const val EXTRA_SCHEDULE_ID = "schedule_id"
         private const val CHANNEL_ID = "playback"
         private const val NOTIF_ID = 42
 
-        fun start(ctx: Context, scheduled: Boolean) {
+        fun start(ctx: Context, scheduled: Boolean, scheduleId: String = "audio") {
+            Log.d("AdhanDebug", "PlaybackService.start(scheduled=$scheduled, scheduleId=$scheduleId)")
             val intent = Intent(ctx, PlaybackService::class.java)
+                .putExtra(EXTRA_SCHEDULE_ID, scheduleId)
             if (scheduled) {
-                AlarmScheduler.stopMillisFor(ctx, System.currentTimeMillis())
+                AlarmScheduler.stopMillisFor(ctx, scheduleId, System.currentTimeMillis())
                     ?.let { intent.putExtra(EXTRA_STOP_AT, it) }
             }
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(intent)

@@ -4,9 +4,9 @@ import '../controllers/app_controller.dart';
 
 class ScheduleCard extends StatelessWidget {
   const ScheduleCard({super.key, required this.controller});
-
+ 
   final AppController controller;
-
+ 
   Future<void> _pickStart(BuildContext context) async {
     final picked = await showTimePicker(
       context: context,
@@ -14,7 +14,7 @@ class ScheduleCard extends StatelessWidget {
     );
     if (picked != null) await controller.setStart(picked);
   }
-
+ 
   Future<void> _pickStop(BuildContext context) async {
     final start = controller.settings.startTime;
     final picked = await showTimePicker(
@@ -24,7 +24,7 @@ class ScheduleCard extends StatelessWidget {
     );
     if (picked != null) await controller.setStop(picked);
   }
-
+ 
   String _nextRunText(BuildContext context) {
     if (!controller.settings.enabled) return 'Turned off';
     final next = controller.nextRun;
@@ -33,7 +33,7 @@ class ScheduleCard extends StatelessWidget {
     final time = TimeOfDay.fromDateTime(next).format(context);
     return 'Next run: $date, $time';
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final s = controller.settings;
